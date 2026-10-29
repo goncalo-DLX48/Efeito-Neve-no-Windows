@@ -53,7 +53,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::geometry::Rect;
-use crate::sim::{Particle, Pile, World};
+use crate::sim::{Particle, Pile, SurfaceKind, World};
 
 /// Número de níveis de opacidade pré-calculados (pincéis ficam em cache).
 const ALPHA_LEVELS: usize = 32;
@@ -357,7 +357,12 @@ impl Renderer {
         let base = (max_h * 0.22).clamp(0.0, 1.25);
 
         let x0 = pile.rect.x;
-        let base_y = pile.rect.y + pile.slide_y;
+        // A barra de tarefas está encostada ao fundo do ecrã: se a neve fosse
+        // desenhada para cima, cobriria o bordo inferior das janelas abertas
+        // por cima dela. O perfil é deslocado para dentro da barra, de modo
+        // que os picos tocam no topo mas a camada não invade as janelas.
+        let inside_taskbar = pile.kind == SurfaceKind::Taskbar;
+        let base_y = pile.rect.y + pile.slide_y + if inside_taskbar { max_h } else { 0.0 };
         // A neve "drapa" 1-2 px pela fachada, em vez de terminar numa linha
         // perfeitamente reta.
         let overhang = (max_h * 0.16).clamp(0.4, 2.2);
@@ -424,7 +429,7 @@ impl Renderer {
         unsafe {
             self.pile_gradient.SetStartPoint(Vector2 {
                 X: 0.0,
-                Y: base_y - max_h - 3.0,
+                Y: base_y - max_h,
             });
             self.pile_gradient
                 .SetEndPoint(Vector2 { X: 0.0, Y: bottom });

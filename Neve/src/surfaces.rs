@@ -23,6 +23,9 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE,
     WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
@@ -137,6 +140,7 @@ impl Tracker {
     }
 
     fn push_taskbar(&mut self, hwnd: HWND, r: RECT, origin: (i32, i32)) {
+        let r = visible_taskbar_rect(hwnd, r);
         let rect = rect_from(r, origin);
         if rect.w >= 8.0 && rect.h >= 8.0 {
             self.surfaces.push(Surface {
@@ -225,6 +229,34 @@ fn rect_from(r: RECT, origin: (i32, i32)) -> Rect {
         (r.right - r.left) as f32,
         (r.bottom - r.top) as f32,
     )
+}
+
+/// A janela `Shell_TrayWnd` inclui uma margem transparente acima da barra
+/// visível (sombra/cantos arredondados no Windows 11). `GetWindowRect` pode
+/// devolver, por exemplo, y=1020/h=60 quando a barra visível começa em y=1032.
+/// Para a neve não "flutuar" sobre o fundo das janelas, remove-se essa margem
+/// com base na altura nominal escalada da barra (48 px a 96 DPI).
+fn visible_taskbar_rect(hwnd: HWND, r: RECT) -> RECT {
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        let screen = info.rcMonitor;
+        if r.bottom >= screen.bottom - 2 {
+            let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+            let scale = if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 };
+            let nominal = (48.0 * scale).round() as i32;
+            let margin = (r.bottom - r.top) - nominal;
+            if margin > 2 {
+                let mut visible = r;
+                visible.top += margin;
+                return visible;
+            }
+        }
+    }
+    r
 }
 
 /// Classes de janelas do shell que não devem receber neve (ocupam o ecrã todo

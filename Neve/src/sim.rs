@@ -78,6 +78,8 @@ enum PileState {
 pub struct Pile {
     /// HWND de origem; 0 quando o monte já foi destacado.
     pub id: isize,
+    /// Tipo de superfície (janela ou barra de tarefas).
+    pub kind: SurfaceKind,
     /// Retângulo da superfície (apenas o topo e a largura são usados).
     pub rect: Rect,
     /// Altura de neve por célula, em px.
@@ -104,12 +106,13 @@ impl Pile {
         let cell_w = s.rect.w / n as f32;
         Self {
             id: s.id,
+            kind: s.kind,
             rect: s.rect,
             cells: vec![0.0; n],
             scratch: vec![0.0; n],
             cell_w,
             max_h: if s.kind == SurfaceKind::Taskbar {
-                32.0
+                9.0
             } else {
                 MAX_PILE_H
             },

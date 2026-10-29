@@ -122,6 +122,11 @@ impl Overlay {
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
+        // Informa o shell de que esta janela não é uma aplicação fullscreen.
+        // Sem isto, um overlay topmost do tamanho do monitor pode fazer o
+        // Windows retirar o WS_EX_TOPMOST à barra de tarefas, deixando as
+        // janelas normais cobrirem-na.
+        mark_not_fullscreen(hwnd);
         overlay.visible = true;
         Ok(overlay)
     }
@@ -205,6 +210,29 @@ impl Overlay {
     pub fn destroy(self) {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Informa o shell (via `ITaskbarList2::MarkFullscreenWindow`) de que o
+/// overlay não deve ser tratado como uma aplicação fullscreen. O Windows
+/// retira o `WS_EX_TOPMOST` à barra de tarefas quando deteta uma janela
+/// fullscreen; sem esta chamada, as janelas normais passam a poder cobri-la.
+fn mark_not_fullscreen(hwnd: HWND) {
+    use windows::core::GUID;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::ITaskbarList2;
+
+    // CLSID_TaskbarList.
+    let clsid = GUID::from_u128(0x56fdf344_fd6d_11d0_958a_006097c9a090);
+    unsafe {
+        if let Ok(taskbar) = CoCreateInstance::<Option<&windows::core::IUnknown>, ITaskbarList2>(
+            &clsid,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
+            let _ = taskbar.HrInit();
+            let _ = taskbar.MarkFullscreenWindow(hwnd, false);
         }
     }
 }

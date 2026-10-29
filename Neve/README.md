@@ -124,6 +124,12 @@ criada, por isso a segunda chamada é necessária). Todo o desenho é feito em
 píxeis físicos com `D2D1_UNIT_MODE_PIXELS`, pelo que a neve tem o mesmo tamanho
 em monitores com escalas diferentes.
 
+Depois de mostrar o overlay, a aplicação chama
+`ITaskbarList2::MarkFullscreenWindow(overlay, FALSE)`. Sem isso, o Windows trata
+uma janela topmost do tamanho do monitor como uma aplicação *fullscreen* e
+retira o `WS_EX_TOPMOST` à barra de tarefas, permitindo que janelas normais a
+cubram.
+
 ### 5.2 Deteção de janelas (`surfaces.rs`)
 
 * `EnumWindows` devolve as janelas de topo **por ordem Z**.
@@ -151,7 +157,9 @@ pequeno desvio lateral), o que forma grumos irregulares em vez de torres
 alinhadas à grelha. As alturas sofrem difusão (alisamento) e deslizamento com
 ângulo de repouso, além de derretimento lento; o máximo é 28 px (32 px na barra
 de tarefas). Uma camada de base contínua cobre toda a superfície com neve, para
-que as faixas deixadas pelo vento não apareçam como "buracos".
+que as faixas deixadas pelo vento não apareçam como "buracos". Na barra de
+tarefas o perfil é desenhado para dentro da barra, para que a neve não invada o
+bordo inferior das janelas abertas por cima dela.
 
 Reações:
 
