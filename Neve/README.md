@@ -145,11 +145,13 @@ Cada floco tem velocidade de queda própria, oscilação lateral harmónica
 soma de três senos de períodos distintos (barato e sem ruído de alta frequência).
 
 A acumulação é um **campo de alturas por superfície**: cada janela tem um vetor
-de alturas (uma célula de 9 px por coluna do topo da janela). Quando um floco
-atravessa o topo, deposita volume na célula correspondente e um pouco nas
-vizinhas; as alturas sofrem difusão (alisamento) e derretimento lento, atingindo
-um equilíbrio que depende da intensidade. O máximo é 24 px (30 px na barra de
-tarefas).
+de alturas (uma célula de 4 px por coluna do topo da janela). Quando um floco
+atravessa o topo, o seu volume é distribuído por uma gaussiana estreita (com um
+pequeno desvio lateral), o que forma grumos irregulares em vez de torres
+alinhadas à grelha. As alturas sofrem difusão (alisamento) e deslizamento com
+ângulo de repouso, além de derretimento lento; o máximo é 28 px (32 px na barra
+de tarefas). Uma camada de base contínua cobre toda a superfície com neve, para
+que as faixas deixadas pelo vento não apareçam como "buracos".
 
 Reações:
 
@@ -171,8 +173,9 @@ realmente visível.
 3. `IDCompositionDevice::CreateTargetForHwnd` + `IDCompositionVisual` — a
    transparência é composta pelo DWM, com alfa por píxel e aceleração de GPU.
 4. Direct2D desenha sobre o back-buffer:
-   * montes: um retângulo arredondado por célula, sobrepostos 1 px (camada
-     contínua com topo ondulado);
+   * montes: um único *path* por troço visível, com o topo suavizado por
+     Béziers (Catmull-Rom) e relevo multi-escala; gradiente branco→azulado e
+     uma sombra ténue dão volume à camada;
    * flocos: `DrawBitmap` de uma textura 32×32 gerada em código (ponto branco
      com queda radial), escalada pela GPU.
 5. `Present(sync=1)` sincroniza com o vblank.

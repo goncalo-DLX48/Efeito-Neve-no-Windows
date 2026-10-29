@@ -20,14 +20,17 @@ use core::mem::ManuallyDrop;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_END_CLOSED, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1,
-    ID2D1SolidColorBrush, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-    D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
-    D2D1_ROUNDED_RECT, D2D1_UNIT_MODE_PIXELS,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Bitmap1, ID2D1Brush, ID2D1Device, ID2D1DeviceContext,
+    ID2D1Factory1, ID2D1GeometrySink, ID2D1GradientStopCollection, ID2D1LinearGradientBrush,
+    ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_UNIT_MODE_PIXELS,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0,
@@ -47,7 +50,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::geometry::Rect;
 use crate::sim::{Particle, Pile, World};
@@ -65,7 +68,14 @@ pub struct Renderer {
     _dcomp_target: IDCompositionTarget,
     _dcomp_visual: IDCompositionVisual,
     _d2d_device: ID2D1Device,
+    d2d_factory: ID2D1Factory1,
     brushes: Vec<ID2D1SolidColorBrush>,
+    /// Sombra azulada projetada pela neve sobre o vidro/moldura.
+    shadow_brushes: Vec<ID2D1SolidColorBrush>,
+    /// Gradiente vertical da camada de neve: branco no topo, azul-acinzentado
+    /// na base (dá volume sem "chapas" brancas).
+    pile_gradient: ID2D1LinearGradientBrush,
+    _pile_stops: ID2D1GradientStopCollection,
     /// Retângulos (ordem Z, retângulo) das janelas com neve, para recortar a
     /// neve das janelas tapadas. Reutilizado entre frames (sem alocações).
     occluders: Vec<(i32, Rect)>,
@@ -152,6 +162,7 @@ impl Renderer {
 
         // --- pincéis brancos por nível de alfa -----------------------------
         let mut brushes = Vec::with_capacity(ALPHA_LEVELS + 1);
+        let mut shadow_brushes = Vec::with_capacity(ALPHA_LEVELS + 1);
         for i in 0..=ALPHA_LEVELS {
             let a = i as f32 / ALPHA_LEVELS as f32;
             let color = D2D1_COLOR_F {
@@ -163,7 +174,61 @@ impl Renderer {
             let brush = unsafe { d2d_context.CreateSolidColorBrush(&color, None) }
                 .map_err(|e| format!("CreateSolidColorBrush: {e}"))?;
             brushes.push(brush);
+
+            let shadow_color = D2D1_COLOR_F {
+                r: 0.58,
+                g: 0.68,
+                b: 0.84,
+                a,
+            };
+            let shadow_brush = unsafe { d2d_context.CreateSolidColorBrush(&shadow_color, None) }
+                .map_err(|e| format!("CreateSolidColorBrush(sombra): {e}"))?;
+            shadow_brushes.push(shadow_brush);
         }
+
+        // --- gradiente da neve acumulada -----------------------------------
+        let stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 0.55,
+                color: D2D1_COLOR_F {
+                    r: 0.965,
+                    g: 0.978,
+                    b: 1.0,
+                    a: 0.97,
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: D2D1_COLOR_F {
+                    r: 0.78,
+                    g: 0.85,
+                    b: 0.97,
+                    a: 0.94,
+                },
+            },
+        ];
+        let rt: &ID2D1RenderTarget = &d2d_context;
+        let stop_collection = unsafe {
+            rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+        }
+        .map_err(|e| format!("CreateGradientStopCollection: {e}"))?;
+        let gradient_props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: Vector2 { X: 0.0, Y: 0.0 },
+            endPoint: Vector2 { X: 0.0, Y: 1.0 },
+        };
+        let pile_gradient = unsafe {
+            d2d_context.CreateLinearGradientBrush(&gradient_props, None, &stop_collection)
+        }
+        .map_err(|e| format!("CreateLinearGradientBrush(neve): {e}"))?;
 
         // --- DirectComposition ---------------------------------------------
         let dcomp_device: IDCompositionDevice =
@@ -204,7 +269,11 @@ impl Renderer {
             _dcomp_target: dcomp_target,
             _dcomp_visual: dcomp_visual,
             _d2d_device: d2d_device,
+            d2d_factory,
             brushes,
+            shadow_brushes,
+            pile_gradient,
+            _pile_stops: stop_collection,
             occluders: Vec::with_capacity(32),
             flake_bitmap,
         })
@@ -215,6 +284,13 @@ impl Renderer {
         let idx =
             ((alpha.clamp(0.0, 1.0) * ALPHA_LEVELS as f32).round() as usize).min(ALPHA_LEVELS);
         &self.brushes[idx]
+    }
+
+    #[inline]
+    fn shadow_brush(&self, alpha: f32) -> &ID2D1SolidColorBrush {
+        let idx =
+            ((alpha.clamp(0.0, 1.0) * ALPHA_LEVELS as f32).round() as usize).min(ALPHA_LEVELS);
+        &self.shadow_brushes[idx]
     }
 
     /// Desenha um frame completo e apresenta-o.
@@ -256,12 +332,12 @@ impl Renderer {
         Ok(())
     }
 
-    /// Monte de neve: um retângulo arredondado por célula.
+    /// Monte de neve com silhueta contínua e orgânica.
     ///
-    /// As células sobrepõem-se 1 px na horizontal, pelo que o resultado é uma
-    /// camada contínua com o topo arredondado (as "ondulações" vêm das alturas
-    /// irregulares produzidas pela deposição). É uma única chamada de desenho
-    /// por célula — a GPU resolve milhões de píxeis sem custo de CPU relevante.
+    /// As células da simulação são apenas amostras de altura. Aqui são unidas
+    /// por uma curva Catmull-Rom (convertida em Béziers cúbicas) e recebem um
+    /// pequeno ruído de baixa frequência: o resultado é uma camada de neve com
+    /// lóbulos e irregularidades suaves, em vez de retângulos por célula.
     fn draw_pile(&self, pile: &Pile) {
         let n = pile.cells.len();
         if n == 0 {
@@ -271,46 +347,105 @@ impl Renderer {
         if alpha <= 0.02 {
             return;
         }
-        let brush = self.brush(alpha);
+        let max_h = pile.max_height();
+        if max_h < 0.12 {
+            return;
+        }
+        // Camada de base contínua: a deposição real concentra-se em faixas
+        // (vento), mas uma superfície com neve nunca fica com "buracos"
+        // alternados. O véu fino preenche os intervalos entre os montes.
+        let base = (max_h * 0.22).clamp(0.0, 1.25);
+
         let x0 = pile.rect.x;
         let base_y = pile.rect.y + pile.slide_y;
-        let cw = pile.cell_w;
+        // A neve "drapa" 1-2 px pela fachada, em vez de terminar numa linha
+        // perfeitamente reta.
+        let overhang = (max_h * 0.16).clamp(0.4, 2.2);
+        let bottom = base_y + overhang;
+        let seed = (pile.id as f32) * 1.618 + x0 * 0.017;
+        let Ok(geometry) = (unsafe { self.d2d_factory.CreatePathGeometry() }) else {
+            return;
+        };
+        let Ok(sink) = (unsafe { geometry.Open() }) else {
+            return;
+        };
 
-        for (i, &h) in pile.cells.iter().enumerate() {
-            if h < 0.2 {
-                continue;
-            }
-            let left = x0 + i as f32 * cw - 0.75;
-            let right = left + cw + 1.5;
-            let top = base_y - h;
-
-            // Recorta as células tapadas por janelas mais acima.
-            let cell = Rect::new(left, top, right - left, base_y - top + 0.6);
-            if self
-                .occluders
-                .iter()
-                .any(|(z, r)| *z < pile.z && intersects(*r, cell))
-            {
-                continue;
-            }
-
-            // Raio pequeno: as células fundem-se numa camada contínua; um raio
-            // próximo de metade da largura criaria cápsulas separadas.
-            let radius = (h * 0.35).clamp(0.4, 2.0);
-            let shape = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left,
-                    top,
-                    right,
-                    bottom: base_y + 0.6,
-                },
-                radiusX: radius,
-                radiusY: radius,
-            };
-            unsafe {
-                self.d2d_context.FillRoundedRectangle(&shape, brush);
+        // Segmentos visíveis (as células tapadas por janelas da frente não são
+        // desenhadas). Cada troço contínuo dá origem a uma figura fechada.
+        let mut run_start: Option<usize> = None;
+        for i in 0..=n {
+            let visible =
+                i < n && pile.cells[i] + base >= 0.12 && self.cell_visible(pile, i, base_y, base);
+            if visible {
+                if run_start.is_none() {
+                    run_start = Some(i);
+                }
+            } else if let Some(start) = run_start.take() {
+                add_snow_run(&sink, pile, start, i, x0, base_y, bottom, seed, base);
             }
         }
+        unsafe {
+            let _ = sink.Close();
+        }
+
+        // Sombra azulada muito ligeira por baixo da neve: dá volume e faz a
+        // camada "assentar" no vidro em vez de flutuar.
+        let shadow_alpha = alpha * 0.30;
+        if shadow_alpha > 0.02 {
+            let shadow = Matrix3x2 {
+                M11: 1.0,
+                M12: 0.0,
+                M21: 0.0,
+                M22: 1.0,
+                M31: 0.55,
+                M32: 1.35,
+            };
+            unsafe {
+                let _ = self.d2d_context.SetTransform(&shadow);
+                let _ = self.d2d_context.FillGeometry(
+                    &geometry,
+                    self.shadow_brush(shadow_alpha),
+                    None::<&ID2D1Brush>,
+                );
+                // O Direct2D não aceita um ponteiro nulo aqui em todas as
+                // versões; repõe a identidade explicitamente.
+                let identity = Matrix3x2 {
+                    M11: 1.0,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: 1.0,
+                    M31: 0.0,
+                    M32: 0.0,
+                };
+                let _ = self.d2d_context.SetTransform(&identity);
+            }
+        }
+
+        unsafe {
+            self.pile_gradient.SetStartPoint(Vector2 {
+                X: 0.0,
+                Y: base_y - max_h - 3.0,
+            });
+            self.pile_gradient
+                .SetEndPoint(Vector2 { X: 0.0, Y: bottom });
+            self.pile_gradient.SetOpacity(alpha);
+            let _ =
+                self.d2d_context
+                    .FillGeometry(&geometry, &self.pile_gradient, None::<&ID2D1Brush>);
+        }
+    }
+
+    /// `true` se a célula `i` não estiver tapada por uma janela mais acima.
+    fn cell_visible(&self, pile: &Pile, i: usize, base_y: f32, base: f32) -> bool {
+        let cw = pile.cell_w;
+        let h = pile.cells[i] + base;
+        let left = pile.rect.x + i as f32 * cw;
+        let top = base_y - h;
+        let cell = Rect::new(left, top, cw, base_y - top + 0.8);
+        !self
+            .occluders
+            .iter()
+            .any(|(z, r)| *z < pile.z && intersects(*r, cell))
     }
 
     /// Desenha os flocos com uma textura de ponto suave (32×32) escalada pela
@@ -377,6 +512,123 @@ impl Renderer {
             self.d2d_context.FillEllipse(&core, self.brush(alpha));
         }
     }
+}
+
+/// Acrescenta uma figura fechada com o perfil suave de um troço de neve.
+#[allow(clippy::too_many_arguments)]
+fn add_snow_run(
+    sink: &ID2D1GeometrySink,
+    pile: &Pile,
+    start: usize,
+    end: usize,
+    x0: f32,
+    base_y: f32,
+    bottom: f32,
+    seed: f32,
+    base: f32,
+) {
+    let n = pile.cells.len();
+    let cw = pile.cell_w;
+    let left = x0 + start as f32 * cw;
+    let right = x0 + end as f32 * cw;
+    let edge_left = start == 0;
+    let edge_right = end == n;
+    // Nas bordas exteriores da superfície a neve prolonga-se um pouco e
+    // "morre" suavemente, como um lábio de neve sobre a aresta.
+    let lip = 1.8;
+    let pl = left - if edge_left { lip } else { 0.0 };
+    let pr = right + if edge_right { lip } else { 0.0 };
+
+    let mut points: Vec<Vector2> = Vec::with_capacity(end - start + 2);
+    if edge_left {
+        let x = left + cw * 0.5;
+        let h = snow_top(pile, x, seed, base);
+        points.push(Vector2 {
+            X: pl,
+            Y: base_y - h * 0.35,
+        });
+    }
+    for i in start..end {
+        let x = x0 + (i as f32 + 0.5) * cw;
+        points.push(Vector2 {
+            X: x,
+            Y: base_y - snow_top(pile, x, seed, base),
+        });
+    }
+    if edge_right {
+        let x = right - cw * 0.5;
+        let h = snow_top(pile, x, seed, base);
+        points.push(Vector2 {
+            X: pr,
+            Y: base_y - h * 0.35,
+        });
+    }
+
+    if points.len() == 1 {
+        let p = points[0];
+        points.insert(
+            0,
+            Vector2 {
+                X: p.X - cw * 0.30,
+                Y: p.Y + 0.15,
+            },
+        );
+        points.push(Vector2 {
+            X: p.X + cw * 0.30,
+            Y: p.Y + 0.15,
+        });
+    } else if points.is_empty() {
+        return;
+    }
+
+    // Catmull-Rom -> Bézier cúbica. A tensão ligeiramente inferior a 1 evita
+    // que o ruído crie pequenos "saltos" acima/abaixo da altura simulada.
+    let mut beziers: Vec<D2D1_BEZIER_SEGMENT> = Vec::with_capacity(points.len());
+    const TENSION: f32 = 6.8;
+    for i in 0..points.len() - 1 {
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points[(i + 2).min(points.len() - 1)];
+        beziers.push(D2D1_BEZIER_SEGMENT {
+            point1: Vector2 {
+                X: p1.X + (p2.X - p0.X) / TENSION,
+                Y: p1.Y + (p2.Y - p0.Y) / TENSION,
+            },
+            point2: Vector2 {
+                X: p2.X - (p3.X - p1.X) / TENSION,
+                Y: p2.Y - (p3.Y - p1.Y) / TENSION,
+            },
+            point3: p2,
+        });
+    }
+
+    unsafe {
+        sink.BeginFigure(Vector2 { X: pl, Y: bottom }, D2D1_FIGURE_BEGIN_FILLED);
+        sink.AddLine(points[0]);
+        sink.AddBeziers(&beziers);
+        sink.AddLine(Vector2 { X: pr, Y: bottom });
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+}
+
+/// Altura da superfície visível em `x`, incluindo o relevo do renderer.
+///
+/// Combina três escalas: deriva lenta (o manto não tem espessura uniforme),
+/// lóbulos médios (grumos de neve) e uma textura fina que quebra a linha
+/// perfeita do topo. A deriva é proporcional à espessura; o ruído fino é
+/// limitado para não parecer serrilhado.
+fn snow_top(pile: &Pile, x: f32, seed: f32, base: f32) -> f32 {
+    let h = pile.height_at(x) + base;
+    let drift = 0.11 * (x * 0.031 + seed * 3.1).sin()
+        + 0.075 * (x * 0.082 + seed * 1.7).sin()
+        + 0.045 * (x * 0.19 + seed * 0.6).sin();
+    let amp = (h.min(14.0) / 14.0) * 0.85 + 0.05;
+    let lumps = amp
+        * (0.55 * (x * 0.44 + seed * 2.3).sin()
+            + 0.34 * (x * 0.97 + seed * 0.9).sin()
+            + 0.14 * (x * 2.1 + seed * 1.3).sin());
+    (h * (1.0 + drift) + lumps).max(0.10)
 }
 
 /// Interseção de dois retângulos.

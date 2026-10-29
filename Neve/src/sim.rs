@@ -18,12 +18,17 @@
 
 use crate::geometry::Rect;
 
-/// Largura (px físicos) de cada célula de acumulação.
-const CELL_W: f32 = 9.0;
+/// Largura (px físicos) de cada célula de acumulação. Células finas permitem
+/// que a silhueta acompanhe irregularidades pequenas; o renderer suaviza-as
+/// numa única curva contínua.
+const CELL_W: f32 = 4.0;
+/// Número máximo de células por monte (ecrãs 8K continuam cobertos).
+const MAX_CELLS: usize = 2048;
 /// Altura máxima (px) de um monte sobre uma janela.
-const MAX_PILE_H: f32 = 24.0;
-/// Derretimento passivo (px/s) por célula.
-const MELT_RATE: f32 = 0.30;
+const MAX_PILE_H: f32 = 28.0;
+/// Derretimento passivo (px/s) por célula. Muito lento: a neve acumulada
+/// persiste e forma camadas, em vez de desaparecer ao ritmo da deposição.
+const MELT_RATE: f32 = 0.05;
 /// Derretimento acelerado (px/s) quando o utilizador escolhe "Melt Snow".
 const FAST_MELT_RATE: f32 = 11.0;
 /// Teto absoluto de partículas, independentemente da resolução.
@@ -93,15 +98,18 @@ pub struct Pile {
 
 impl Pile {
     fn new(s: Surface) -> Self {
-        let n = ((s.rect.w / CELL_W).ceil() as usize).clamp(1, 512);
+        let n = ((s.rect.w / CELL_W).ceil() as usize).clamp(1, MAX_CELLS);
+        // Em ecrãs muito largos o limite de células é atingido; nesse caso a
+        // largura da célula cresce para que a última coincida com a borda.
+        let cell_w = s.rect.w / n as f32;
         Self {
             id: s.id,
             rect: s.rect,
             cells: vec![0.0; n],
             scratch: vec![0.0; n],
-            cell_w: CELL_W,
+            cell_w,
             max_h: if s.kind == SurfaceKind::Taskbar {
-                30.0
+                32.0
             } else {
                 MAX_PILE_H
             },
@@ -129,40 +137,96 @@ impl Pile {
     }
 
     /// Deposição de um floco de raio `r` na abcissa `x`.
+    ///
+    /// O volume é distribuído por uma gaussiana estreita (em vez de uma coluna
+    /// única), o que produz grumos arredondados em vez de torres alinhadas à
+    /// grelha de células. O total depositado é independente da largura da
+    /// célula.
     fn deposit(&mut self, x: f32, r: f32) {
         let n = self.cells.len();
-        if n == 0 {
+        if n == 0 || !x.is_finite() {
             return;
         }
-        let idx =
-            (((x - self.rect.x) / self.cell_w).floor() as isize).clamp(0, n as isize - 1) as usize;
-        // Volume do floco convertido em altura de coluna (9 px de largura).
-        let add = 0.45 + r * 0.32;
-        self.cells[idx] = (self.cells[idx] + add).min(self.max_h);
-        if idx > 0 {
-            self.cells[idx - 1] = (self.cells[idx - 1] + add * 0.30).min(self.max_h);
+        let center = (x - self.rect.x) / self.cell_w;
+        let sigma = (1.9 + r * 0.85) / self.cell_w;
+        if !(sigma > 0.0) {
+            return;
         }
-        if idx + 1 < n {
-            self.cells[idx + 1] = (self.cells[idx + 1] + add * 0.30).min(self.max_h);
+        let reach = (sigma * 2.6).ceil() as isize;
+        let lo = (center.floor() as isize - reach).max(0);
+        let hi = (center.floor() as isize + reach).min(n as isize - 1);
+        if lo > hi {
+            return;
+        }
+
+        let mut wsum = 0.0;
+        for i in lo..=hi {
+            let d = (i as f32 + 0.5 - center) / sigma;
+            wsum += (-0.5 * d * d).exp();
+        }
+        if !(wsum > 0.0) {
+            return;
+        }
+
+        // Volume total do floco convertido em altura somada. Os flocos maiores
+        // acrescentam mais neve; o valor não depende de `cell_w`.
+        let amount = 1.1 + r * 0.62;
+        for i in lo..=hi {
+            let d = (i as f32 + 0.5 - center) / sigma;
+            let w = (-0.5 * d * d).exp() / wsum;
+            let idx = i as usize;
+            self.cells[idx] = (self.cells[idx] + amount * w).min(self.max_h);
         }
     }
 
-    /// Difusão: cada célula aproxima-se da média dos vizinhos. Cria o perfil
-    /// suave de um monte de neve e evita "picos" de uma única célula.
+    /// Difusão + deslizamento (ângulo de repouso). A difusão alisa o monte ao
+    /// longo de ~1 s; o deslizamento move neve de cristas demasiado íngremes
+    /// para as células vizinhas, criando encostas naturais em vez de degraus.
     fn relax(&mut self, dt: f32) {
         let n = self.cells.len();
         if n < 3 {
             return;
         }
-        // k ≈ 0,8 s⁻¹: alisa ao longo de ~1 s, mantendo as irregularidades
-        // naturais da deposição (não achata o monte numa linha reta).
-        let k = (dt * 0.8).min(0.2);
+        let k = (dt * 2.4).min(0.28);
         for i in 0..n {
             let l = self.cells[i.saturating_sub(1)];
             let r = self.cells[(i + 1).min(n - 1)];
             self.scratch[i] = self.cells[i] + k * (0.5 * (l + r) - self.cells[i]);
         }
         std::mem::swap(&mut self.cells, &mut self.scratch);
+
+        // Inclinação máxima admissível (px por célula). Com células de 4 px,
+        // 2,2 px correspondem a ~29°, próximo do ângulo de repouso da neve.
+        let max_step = 2.2;
+        let slip_k = (dt * 5.0).min(0.5) * 0.5;
+        for i in 0..n - 1 {
+            let d = self.cells[i] - self.cells[i + 1];
+            if d.abs() <= max_step {
+                continue;
+            }
+            let slip = (d.abs() - max_step) * slip_k;
+            if d > 0.0 {
+                self.cells[i] -= slip;
+                self.cells[i + 1] += slip;
+            } else {
+                self.cells[i] += slip;
+                self.cells[i + 1] -= slip;
+            }
+        }
+        for i in (0..n - 1).rev() {
+            let d = self.cells[i] - self.cells[i + 1];
+            if d.abs() <= max_step {
+                continue;
+            }
+            let slip = (d.abs() - max_step) * slip_k;
+            if d > 0.0 {
+                self.cells[i] -= slip;
+                self.cells[i + 1] += slip;
+            } else {
+                self.cells[i] += slip;
+                self.cells[i + 1] -= slip;
+            }
+        }
     }
 
     fn decay(&mut self, amount: f32) {
@@ -455,7 +519,11 @@ impl World {
             }
 
             if let Some((pi, _)) = landing {
-                self.piles[pi].deposit(x, p.r);
+                // Pequeno desvio lateral: os flocos não caem todos na mesma
+                // coluna, o que quebra a periodicidade da grelha e forma
+                // grumos irregulares.
+                let jitter = self.range(-0.8 - p.r * 0.7, 0.8 + p.r * 0.7);
+                self.piles[pi].deposit(x + jitter, p.r);
                 self.particles.swap_remove(i);
                 continue;
             }
