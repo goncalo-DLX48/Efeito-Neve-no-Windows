@@ -118,6 +118,8 @@ pub struct App {
     display_dirty: bool,
     surfaces_dirty: bool,
     behind_timer: f32,
+    /// Guarda periódica do topmost da barra de tarefas.
+    taskbar_timer: f32,
     render_broken: bool,
     running: bool,
     /// Diagnóstico: contagem de frames para o log de FPS.
@@ -143,6 +145,7 @@ impl App {
             display_dirty: false,
             surfaces_dirty: false,
             behind_timer: 0.0,
+            taskbar_timer: 0.0,
             render_broken: false,
             running: true,
             frame_count: 0,
@@ -301,6 +304,16 @@ impl App {
         self.tracker.update(dt, self.origin);
         self.world
             .sync_surfaces(&self.tracker.surfaces, self.settings.accumulate);
+
+        // O shell pode retirar o topmost à barra de tarefas depois de mudanças
+        // de foco; reafirma-o a cada 0,25 s se necessário.
+        self.taskbar_timer += dt;
+        if self.taskbar_timer >= 0.25 {
+            self.taskbar_timer = 0.0;
+            if let Some(overlay) = &self.overlay {
+                overlay.ensure_taskbar_on_top();
+            }
+        }
 
         if self.settings.intensity.is_off() {
             return;

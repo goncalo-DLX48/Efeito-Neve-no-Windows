@@ -18,12 +18,13 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, HBRUSH, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassExW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, HCURSOR,
-    HICON, HWND_BOTTOM, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetWindowLongPtrW,
+    RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW,
+    GWL_EXSTYLE, HCURSOR, HICON, HWND_BOTTOM, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::renderer::Renderer;
@@ -145,6 +146,43 @@ impl Overlay {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
             self.visible = true;
+            self.ensure_taskbar_on_top();
+        }
+    }
+
+    /// Verifica periodicamente se o Windows voltou a retirar o `WS_EX_TOPMOST`
+    /// à barra de tarefas (acontece após algumas mudanças de foco/janela). Se
+    /// sim, volta a marcar o overlay como não-fullscreen e reafirma o topmost.
+    pub fn ensure_taskbar_on_top(&self) {
+        if self.behind || !self.visible {
+            return;
+        }
+        let class = winutil::wide("Shell_TrayWnd");
+        unsafe {
+            let Ok(tray) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) else {
+                return;
+            };
+            if tray.0.is_null() {
+                return;
+            }
+            let ex = GetWindowLongPtrW(tray, GWL_EXSTYLE);
+            if ex & (WS_EX_TOPMOST.0 as isize) != 0 {
+                return;
+            }
+            mark_not_fullscreen(self.hwnd);
+            // Reafirma o topmost, mas deixa a barra *abaixo* do overlay para
+            // a neve continuar visível por cima dela.
+            let ex = GetWindowLongPtrW(tray, GWL_EXSTYLE) | WS_EX_TOPMOST.0 as isize;
+            let _ = SetWindowLongPtrW(tray, GWL_EXSTYLE, ex);
+            let _ = SetWindowPos(
+                tray,
+                Some(self.hwnd),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
         }
     }
 

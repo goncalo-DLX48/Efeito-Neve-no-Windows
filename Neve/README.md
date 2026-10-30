@@ -129,7 +129,9 @@ Depois de mostrar o overlay, a aplicação chama
 `ITaskbarList2::MarkFullscreenWindow(overlay, FALSE)`. Sem isso, o Windows trata
 uma janela topmost do tamanho do monitor como uma aplicação *fullscreen* e
 retira o `WS_EX_TOPMOST` à barra de tarefas, permitindo que janelas normais a
-cubram.
+cubram. O topmost da barra é ainda verificado a cada 0,25 s; se tiver sido
+retirado, o overlay é novamente marcado como não-fullscreen e a barra é
+reinserida no topmost **abaixo** do overlay (para a neve continuar visível).
 
 ### 5.2 Deteção de janelas (`surfaces.rs`)
 
