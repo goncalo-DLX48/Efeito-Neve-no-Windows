@@ -18,21 +18,42 @@
 
 use crate::geometry::Rect;
 
-/// Largura (px físicos) de cada célula de acumulação. Células finas permitem
-/// que a silhueta acompanhe irregularidades pequenas; o renderer suaviza-as
-/// numa única curva contínua.
-const CELL_W: f32 = 4.0;
+/// Largura (px físicos) de cada célula de acumulação. Células de 2 px permitem
+/// curvas contínuas e um alisamento térmico sem facetas visíveis.
+const CELL_W: f32 = 2.0;
 /// Número máximo de células por monte (ecrãs 8K continuam cobertos).
-const MAX_CELLS: usize = 2048;
-/// Altura máxima (px) de um monte sobre uma janela.
-const MAX_PILE_H: f32 = 28.0;
-/// Derretimento passivo (px/s) por célula. Muito lento: a neve acumulada
-/// persiste e forma camadas, em vez de desaparecer ao ritmo da deposição.
-const MELT_RATE: f32 = 0.05;
+const MAX_CELLS: usize = 4096;
+/// Altura máxima (px) da neve sobre o topo de uma janela.
+pub const MAX_WINDOW_SNOW: f32 = 24.0;
+/// Altura máxima (px) da neve sobre a barra de tarefas. Mantém os ícones e a
+/// navegação visíveis.
+pub const MAX_TASKBAR_SNOW: f32 = 48.0;
+/// Derretimento passivo (px/s) por célula. Zero: o excesso é redistribuído ou
+/// descartado nos limites, não é preciso derreter a camada inteira.
+const MELT_RATE: f32 = 0.0;
 /// Derretimento acelerado (px/s) quando o utilizador escolhe "Melt Snow".
-const FAST_MELT_RATE: f32 = 11.0;
+const FAST_MELT_RATE: f32 = 120.0;
 /// Teto absoluto de partículas, independentemente da resolução.
 pub const MAX_PARTICLES: usize = 3000;
+
+/// Velocidade de escavação: fração de altura removida por segundo no centro
+/// do raio do cursor (com falloff suave até à borda).
+const CARVE_RATE: f32 = 12.0;
+/// Número máximo de partículas soltas (efeito de escavação).
+const MAX_LOOSE: usize = 320;
+/// Gravidade aplicada às partículas soltas (px/s²).
+const LOOSE_GRAVITY: f32 = 1400.0;
+/// Velocidade do cursor (px/s) a partir da qual se soltam partículas.
+const LOOSE_SPEED_MIN: f32 = 220.0;
+/// Distância (px) a partir do topo em que a neve no bordo de uma janela
+/// transborda (só quando a coluna está praticamente cheia).
+const EDGE_SPILL_MARGIN: f32 = 3.0;
+/// Fração do excesso no bordo que transborda por segundo.
+const EDGE_SPILL_RATE: f32 = 0.8;
+/// Máximo de partículas de transbordo criadas por monte/frame.
+const EDGE_SPILL_BUDGET: usize = 8;
+/// Raio máximo (em células) para onde o excesso de uma célula cheia escorrega.
+const CAP_SPREAD_CELLS: isize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceKind {
@@ -84,10 +105,14 @@ pub struct Pile {
     pub rect: Rect,
     /// Altura de neve por célula, em px.
     pub cells: Vec<f32>,
+    /// Marca de escavação por célula (0 = intacta, 1 = buraco). Impede a
+    /// difusão/deslizamento de preencher o buraco por baixo; só a deposição de
+    /// novos flocos o reduz.
+    pub hole: Vec<f32>,
     /// Buffer auxiliar para a difusão (evita alocar por frame).
     scratch: Vec<f32>,
     pub cell_w: f32,
-    /// Altura máxima admissível (a barra de tarefas acumula um pouco mais).
+    /// Altura máxima admissível.
     max_h: f32,
     /// Ordem Z da superfície de origem.
     pub z: i32,
@@ -96,6 +121,17 @@ pub struct Pile {
     slide_v: f32,
     fade: f32,
     melting: bool,
+}
+
+/// Partícula solta projetada pela passagem rápida do cursor sobre a neve.
+#[derive(Clone, Copy, Debug)]
+pub struct LooseSnow {
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub r: f32,
+    pub alpha: f32,
 }
 
 impl Pile {
@@ -109,12 +145,13 @@ impl Pile {
             kind: s.kind,
             rect: s.rect,
             cells: vec![0.0; n],
+            hole: vec![0.0; n],
             scratch: vec![0.0; n],
             cell_w,
             max_h: if s.kind == SurfaceKind::Taskbar {
-                9.0
+                MAX_TASKBAR_SNOW
             } else {
-                MAX_PILE_H
+                MAX_WINDOW_SNOW
             },
             z: s.z,
             state: PileState::Settled,
@@ -139,10 +176,24 @@ impl Pile {
         a + (b - a) * t
     }
 
+    /// Intensidade do buraco escavado em `x` (0 = intacto, 1 = vazio).
+    pub fn hole_at(&self, x: f32) -> f32 {
+        let n = self.hole.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let f = (x - self.rect.x) / self.cell_w - 0.5;
+        let i = f.floor();
+        let t = f - i;
+        let a = self.hole[i.clamp(0.0, (n - 1) as f32) as usize];
+        let b = self.hole[(i + 1.0).clamp(0.0, (n - 1) as f32) as usize];
+        a + (b - a) * t
+    }
+
     /// Deposição de um floco de raio `r` na abcissa `x`.
     ///
     /// O volume é distribuído por uma gaussiana estreita (em vez de uma coluna
-    /// única), o que produz grumos arredondados em vez de torres alinhadas à
+    /// única), o que produz grumos arredondados em vez de torres alinhadas �
     /// grelha de células. O total depositado é independente da largura da
     /// célula.
     fn deposit(&mut self, x: f32, r: f32) {
@@ -174,62 +225,187 @@ impl Pile {
         // Volume total do floco convertido em altura somada. Os flocos maiores
         // acrescentam mais neve; o valor não depende de `cell_w`.
         let amount = 1.1 + r * 0.62;
+        let mut excess = 0.0;
         for i in lo..=hi {
             let d = (i as f32 + 0.5 - center) / sigma;
             let w = (-0.5 * d * d).exp() / wsum;
             let idx = i as usize;
-            self.cells[idx] = (self.cells[idx] + amount * w).min(self.max_h);
+            let before = self.cells[idx];
+            let desired = before + amount * w;
+            let after = desired.min(self.max_h);
+            self.cells[idx] = after;
+            excess += (desired - after).max(0.0);
+            let added = after - before;
+            if added > 0.0 && self.hole[idx] > 0.0 {
+                self.hole[idx] = (self.hole[idx] - added * 0.08).max(0.0);
+            }
+        }
+        if excess > 1e-4 {
+            // No teto, os flocos novos escorregam para as células vizinhas
+            // mais baixas. O que não couber derrete.
+            self.redistribute_excess(center.round() as isize, excess);
         }
     }
 
-    /// Difusão + deslizamento (ângulo de repouso). A difusão alisa o monte ao
-    /// longo de ~1 s; o deslizamento move neve de cristas demasiado íngremes
-    /// para as células vizinhas, criando encostas naturais em vez de degraus.
+    /// Espalha o excesso de uma célula cheia para as células mais baixas mais
+    /// próximas (até `CAP_SPREAD_CELLS`), alternando esquerda/direita. O que
+    /// não couber é descartado, como neve que derrete no topo.
+    fn redistribute_excess(&mut self, center: isize, mut excess: f32) {
+        let n = self.cells.len() as isize;
+        if n == 0 || excess <= 0.0 {
+            return;
+        }
+        for dist in 1..=CAP_SPREAD_CELLS {
+            for side in [-1isize, 1isize] {
+                if excess <= 1e-4 {
+                    return;
+                }
+                let idx = center + side * dist;
+                if idx < 0 || idx >= n {
+                    continue;
+                }
+                let idx = idx as usize;
+                let room = (self.max_h - self.cells[idx]).max(0.0);
+                if room <= 0.0 {
+                    continue;
+                }
+                let add = room.min(excess);
+                self.cells[idx] += add;
+                excess -= add;
+                if self.hole[idx] > 0.0 {
+                    self.hole[idx] = (self.hole[idx] - add * 0.5).max(0.0);
+                }
+            }
+        }
+    }
+
+    /// Relaxamento térmico + deslizamento (ângulo de repouso).
+    ///
+    /// Duas passagens do filtro `(h[i-1] + 2*h[i] + h[i+1]) / 4` por tick dão o
+    /// comportamento de fluido viscoso denso: a superfície torna-se contínua e
+    /// sem dentes. O deslizamento corrige declives acima do ângulo de repouso.
     fn relax(&mut self, dt: f32) {
         let n = self.cells.len();
         if n < 3 {
             return;
         }
-        let k = (dt * 2.4).min(0.28);
-        for i in 0..n {
-            let l = self.cells[i.saturating_sub(1)];
-            let r = self.cells[(i + 1).min(n - 1)];
-            self.scratch[i] = self.cells[i] + k * (0.5 * (l + r) - self.cells[i]);
-        }
-        std::mem::swap(&mut self.cells, &mut self.scratch);
 
-        // Inclinação máxima admissível (px por célula). Com células de 4 px,
-        // 2,2 px correspondem a ~29°, próximo do ângulo de repouso da neve.
-        let max_step = 2.2;
-        let slip_k = (dt * 5.0).min(0.5) * 0.5;
-        for i in 0..n - 1 {
-            let d = self.cells[i] - self.cells[i + 1];
-            if d.abs() <= max_step {
-                continue;
+        for _ in 0..2 {
+            for i in 0..n {
+                let l = self.cells[i.saturating_sub(1)];
+                let r = self.cells[(i + 1).min(n - 1)];
+                self.scratch[i] = (l + 2.0 * self.cells[i] + r) * 0.25;
             }
-            let slip = (d.abs() - max_step) * slip_k;
-            if d > 0.0 {
-                self.cells[i] -= slip;
-                self.cells[i + 1] += slip;
-            } else {
-                self.cells[i] += slip;
-                self.cells[i + 1] -= slip;
+            std::mem::swap(&mut self.cells, &mut self.scratch);
+        }
+
+        // A marca de escavação desvanece: a camada de base volta a cobrir a
+        // cratera à medida que o relevo assenta.
+        let hole_decay = dt * 0.8;
+        for h in &mut self.hole {
+            *h = (*h - hole_decay).max(0.0);
+        }
+
+        // Inclinação máxima admissível. Com células de 2 px, 0,9 px por célula
+        // correspondem a ~24°, próximo do ângulo de repouso.
+        let max_step = 0.9;
+        let slip_k = (dt * 9.0).min(0.55);
+        for _ in 0..8 {
+            for i in 0..n - 1 {
+                let d = self.cells[i] - self.cells[i + 1];
+                if d.abs() <= max_step {
+                    continue;
+                }
+                let slip = (d.abs() - max_step) * slip_k;
+                if d > 0.0 {
+                    self.cells[i] -= slip;
+                    self.cells[i + 1] += slip;
+                } else {
+                    self.cells[i] += slip;
+                    self.cells[i + 1] -= slip;
+                }
+            }
+            for i in (0..n - 1).rev() {
+                let d = self.cells[i] - self.cells[i + 1];
+                if d.abs() <= max_step {
+                    continue;
+                }
+                let slip = (d.abs() - max_step) * slip_k;
+                if d > 0.0 {
+                    self.cells[i] -= slip;
+                    self.cells[i + 1] += slip;
+                } else {
+                    self.cells[i] += slip;
+                    self.cells[i + 1] -= slip;
+                }
             }
         }
-        for i in (0..n - 1).rev() {
-            let d = self.cells[i] - self.cells[i + 1];
-            if d.abs() <= max_step {
+    }
+
+    /// Escava um buraco centrado em `x` com o raio dado. O volume removido é
+    /// empurrado para cristas laterais, com mais massa à frente do movimento
+    /// (`dir_x` entre -1 e 1). Devolve o volume que não coube no monte (bordo
+    /// esquerdo, bordo direito), para o chamador o transformar em neve em
+    /// queda ou o varrer para fora do ecrã.
+    fn carve(&mut self, x: f32, radius: f32, dt: f32, dir_x: f32) -> (f32, f32) {
+        let n = self.cells.len();
+        if n == 0 || radius <= 0.0 || !x.is_finite() {
+            return (0.0, 0.0);
+        }
+        let cw = self.cell_w;
+        let center = (x - self.rect.x) / cw;
+        let r_cells = radius / cw;
+        let lo = (center - r_cells).floor().max(0.0) as usize;
+        let hi = ((center + r_cells).ceil() as isize).clamp(0, n as isize - 1) as usize;
+
+        let mut removed_left = 0.0;
+        let mut removed_right = 0.0;
+        for i in lo..=hi {
+            let cx = self.rect.x + (i as f32 + 0.5) * cw;
+            let d = (cx - x).abs();
+            if d > radius {
                 continue;
             }
-            let slip = (d.abs() - max_step) * slip_k;
-            if d > 0.0 {
-                self.cells[i] -= slip;
-                self.cells[i + 1] += slip;
+            // Falloff smoothstep: derivada nula nas extremidades, pelo que a
+            // cratera se funde na superfície sem arestas.
+            let f = 1.0 - d / radius;
+            let f = f * f * (3.0 - 2.0 * f);
+            if self.hole[i] < f {
+                self.hole[i] = f;
+            }
+            let cut = self.cells[i] * (1.0 - (-dt * CARVE_RATE * f).exp());
+            if cut <= 0.0 {
+                continue;
+            }
+            self.cells[i] -= cut;
+            if cx < x {
+                removed_left += cut;
             } else {
-                self.cells[i] += slip;
-                self.cells[i + 1] -= slip;
+                removed_right += cut;
             }
         }
+
+        // Reparte o volume total: a maior parte segue a direção do movimento,
+        // criando um monte à frente; o resto fica atrás. A soma é conservada.
+        let total = removed_left + removed_right;
+        if total <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let dir = dir_x.clamp(-1.0, 1.0);
+        let forward = total * (0.5 + 0.35 * dir.abs());
+        let back = total - forward;
+        let (left_amount, right_amount) = if dir >= 0.0 {
+            (back, forward)
+        } else {
+            (forward, back)
+        };
+
+        let reach = (r_cells.ceil() as isize).max(1) + 1;
+        let center_i = center.round() as isize;
+        let span = ((r_cells * 0.9).round() as isize).clamp(3, 10);
+        let overflow_left = push_lobe(self, center_i - reach, -1, left_amount, span);
+        let overflow_right = push_lobe(self, center_i + reach, 1, right_amount, span);
+        (overflow_left, overflow_right)
     }
 
     fn decay(&mut self, amount: f32) {
@@ -244,8 +420,9 @@ impl Pile {
 
     pub fn alpha(&self) -> f32 {
         match self.state {
-            PileState::Settled => 0.93,
-            PileState::Sliding => self.fade * 0.93,
+            // Neve acumulada é totalmente opaca.
+            PileState::Settled => 1.0,
+            PileState::Sliding => self.fade.clamp(0.0, 1.0),
         }
     }
 
@@ -270,13 +447,49 @@ impl Pile {
     }
 }
 
+/// Distribui `amount` de neve numa faixa de `span` células a partir de `start`,
+/// na direção `dir` (crista lateral criada pela escavação). A altura decai
+/// linearmente para o exterior. Devolve o volume que não pôde ser colocado
+/// (fora do monte ou acima de `max_h`), para transbordar.
+fn push_lobe(pile: &mut Pile, start: isize, dir: isize, amount: f32, span: isize) -> f32 {
+    if amount <= 0.0 || span <= 0 {
+        return amount.max(0.0);
+    }
+    let n = pile.cells.len() as isize;
+    let span = span.max(1);
+    let wsum = (span * (span + 1) / 2) as f32;
+    let mut added_total = 0.0;
+    for k in 1..=span {
+        let j = start + dir * (k - 1);
+        if j < 0 || j >= n {
+            continue;
+        }
+        let j = j as usize;
+        let w = (span - k + 1) as f32 / wsum;
+        let before = pile.cells[j];
+        let after = (before + amount * w).min(pile.max_h);
+        pile.cells[j] = after;
+        let added = after - before;
+        added_total += added;
+        if added > 0.0 && pile.hole[j] > 0.0 {
+            pile.hole[j] = (pile.hole[j] - added * 0.5).max(0.0);
+        }
+    }
+    (amount - added_total).max(0.0)
+}
+
 pub struct World {
     pub width: f32,
     pub height: f32,
     pub time: f32,
     pub particles: Vec<Particle>,
     pub piles: Vec<Pile>,
+    /// Partículas soltas projetadas pelo cursor ao escavar.
+    pub loose: Vec<LooseSnow>,
     spawn_acc: f32,
+    /// Última posição do cursor (para calcular a velocidade).
+    cursor_last: Option<(f32, f32)>,
+    loose_acc: f32,
     rng: u32,
 }
 
@@ -288,7 +501,10 @@ impl World {
             time: 0.0,
             particles: Vec::with_capacity(MAX_PARTICLES.min(1024)),
             piles: Vec::with_capacity(32),
+            loose: Vec::with_capacity(MAX_LOOSE),
             spawn_acc: 0.0,
+            cursor_last: None,
+            loose_acc: 0.0,
             rng: 0x9E37_79B9,
         }
     }
@@ -299,6 +515,9 @@ impl World {
         self.height = height;
         self.particles
             .retain(|p| p.x >= -40.0 && p.x <= width + 40.0 && p.y < height + 40.0);
+        self.loose
+            .retain(|p| p.x >= -40.0 && p.x <= width + 40.0 && p.y < height + 40.0);
+        self.cursor_last = None;
         // Montes antigos deixam de fazer sentido: desaparecem suavemente.
         for p in &mut self.piles {
             p.detach();
@@ -308,8 +527,11 @@ impl World {
     /// Limpa tudo (usado ao desligar a neve).
     pub fn reset(&mut self) {
         self.particles.clear();
+        self.loose.clear();
         self.piles.clear();
         self.spawn_acc = 0.0;
+        self.loose_acc = 0.0;
+        self.cursor_last = None;
         self.time = 0.0;
     }
 
@@ -317,6 +539,7 @@ impl World {
     pub fn melt_all(&mut self) {
         for p in &mut self.piles {
             p.melting = true;
+            p.hole.fill(0.0);
         }
     }
 
@@ -423,6 +646,224 @@ impl World {
         26.0 * (t * 0.19).sin() + 13.0 * (t * 0.47 + 1.7).sin() + 6.5 * (t * 1.07 + 0.4).sin()
     }
 
+    /// Interação do cursor: escava a neve sob o ponteiro e, se o movimento for
+    /// rápido, projeta partículas soltas para os lados.
+    ///
+    /// `cursor` está em coordenadas locais do overlay; `None` quando o cursor
+    /// não está disponível (ex.: overlay desligado).
+    pub fn interact(&mut self, cursor: Option<(f32, f32)>, radius: f32, dt: f32) {
+        let Some((x, y)) = cursor else {
+            self.cursor_last = None;
+            return;
+        };
+        if !x.is_finite() || !y.is_finite() || !(radius > 0.0) {
+            return;
+        }
+        let dt = dt.max(0.001);
+        let (vx, vy) = match self.cursor_last {
+            Some((lx, ly)) => ((x - lx) / dt, (y - ly) / dt),
+            None => (0.0, 0.0),
+        };
+        self.cursor_last = Some((x, y));
+        let raw_speed = (vx * vx + vy * vy).sqrt();
+        // Um salto grande (mudança de monitor, alt-tab) não deve gerar uma
+        // rajada de partículas.
+        let speed = if raw_speed > 5000.0 { 0.0 } else { raw_speed };
+
+        // Escolhe o monte mais à frente cuja massa de neve contém o cursor.
+        let mut target: Option<(usize, f32, f32)> = None; // (índice, superfície, base)
+        for (i, pile) in self.piles.iter().enumerate() {
+            if pile.state != PileState::Settled || pile.max_height() < 0.05 {
+                continue;
+            }
+            if x < pile.rect.x - 2.0 || x > pile.rect.right() + 2.0 {
+                continue;
+            }
+            let base_y = pile.rect.y + pile.slide_y;
+            let top = base_y - pile.height_at(x);
+            // Numa janela, só a massa de neve (e uma pequena margem) é
+            // interativa; na barra de tarefas toda a barra o é, para que uma
+            // camada fina também possa ser afastada.
+            let over_snow = if pile.kind == SurfaceKind::Taskbar {
+                y >= top - 8.0 && y <= pile.rect.bottom() + 8.0
+            } else {
+                y >= top - 8.0 && y <= base_y + 8.0
+            };
+            if !over_snow {
+                continue;
+            }
+            if self.point_covered(x, top, i) {
+                continue;
+            }
+            let better = match target {
+                Some((ti, _, _)) => pile.z < self.piles[ti].z,
+                None => true,
+            };
+            if better {
+                target = Some((i, top, base_y));
+            }
+        }
+
+        let Some((pi, surface, base_y)) = target else {
+            return;
+        };
+        let speed_for_particles = speed;
+        let dir = if raw_speed > 30.0 {
+            (vx / raw_speed.max(1.0)).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let (overflow_left, overflow_right) = self.piles[pi].carve(x, radius, dt, dir);
+        self.handle_carve_overflow(pi, overflow_left, overflow_right);
+
+        if speed_for_particles > LOOSE_SPEED_MIN && self.loose.len() < MAX_LOOSE {
+            let count =
+                ((speed_for_particles - LOOSE_SPEED_MIN) / 160.0).clamp(0.0, 4.0) * (dt * 60.0);
+            self.loose_acc += count;
+            let dir = if vx.abs() > 30.0 {
+                vx.signum()
+            } else if self.range(0.0, 1.0) < 0.5 {
+                -1.0
+            } else {
+                1.0
+            };
+            while self.loose_acc >= 1.0 && self.loose.len() < MAX_LOOSE {
+                self.loose_acc -= 1.0;
+                let sx = x + self.range(-7.0, 7.0);
+                let sy = y.clamp(surface, base_y) - self.range(0.0, 5.0);
+                let vx0 = dir * self.range(60.0, 190.0) + vx.clamp(-400.0, 400.0) * 0.2;
+                let vy0 = -self.range(40.0, 190.0) + vy.clamp(-100.0, 100.0) * 0.1;
+                let r = self.range(0.8, 1.8);
+                self.loose.push(LooseSnow {
+                    x: sx,
+                    y: sy,
+                    vx: vx0,
+                    vy: vy0,
+                    r,
+                    alpha: 1.0,
+                });
+            }
+        }
+    }
+
+    /// O bordo de um monte coincide com o limite do ecrã? A barra de tarefas
+    /// é sempre tratada como limite; nesses bordos não há transbordo natural
+    /// (o excesso empurrado pelo cursor é varrido para fora).
+    fn edge_is_screen(&self, pile: &Pile, left: bool) -> bool {
+        if pile.kind == SurfaceKind::Taskbar {
+            return true;
+        }
+        if left {
+            pile.rect.x <= 0.5
+        } else {
+            pile.rect.right() >= self.width - 0.5
+        }
+    }
+
+    /// Encaminha o volume que não coube nas cristas. Nos bordos interiores de
+    /// uma janela cai como neve solta; nos limites do ecrã é varrido para fora
+    /// do monitor (as partículas saem e são descartadas).
+    fn handle_carve_overflow(&mut self, pi: usize, left: f32, right: f32) {
+        if left > 0.02 {
+            self.spawn_edge_particles(pi, true, left);
+        }
+        if right > 0.02 {
+            self.spawn_edge_particles(pi, false, right);
+        }
+    }
+
+    /// Cria partículas soltas que caem do canto de uma janela. A massa já foi
+    /// retirada do monte por quem chama.
+    fn spawn_edge_particles(&mut self, pi: usize, left: bool, amount: f32) {
+        if amount <= 0.0 || self.loose.len() >= MAX_LOOSE {
+            return;
+        }
+        let (x_edge, y_edge) = {
+            let pile = &self.piles[pi];
+            let idx = if left {
+                0
+            } else {
+                pile.cells.len().saturating_sub(1)
+            };
+            let h = pile.cells.get(idx).copied().unwrap_or(0.0);
+            let x = if left {
+                pile.rect.x - 2.0
+            } else {
+                pile.rect.right() + 2.0
+            };
+            (x, pile.rect.y + pile.slide_y - h)
+        };
+        // Não emitir de um canto escondido por uma janela da frente.
+        if self.point_covered(x_edge, y_edge, pi) {
+            return;
+        }
+        let count = ((amount / 0.5).ceil() as usize).clamp(1, EDGE_SPILL_BUDGET);
+        for _ in 0..count {
+            if self.loose.len() >= MAX_LOOSE {
+                break;
+            }
+            let dir = if left { -1.0 } else { 1.0 };
+            let px = x_edge + self.range(-2.0, 2.0);
+            let py = y_edge + self.range(-3.0, 2.0);
+            let pvx = dir * self.range(15.0, 75.0);
+            let pvy = self.range(-35.0, 25.0);
+            let pr = self.range(0.8, 1.7);
+            self.loose.push(LooseSnow {
+                x: px,
+                y: py,
+                vx: pvx,
+                vy: pvy,
+                r: pr,
+                alpha: 1.0,
+            });
+        }
+    }
+
+    /// Transbordo natural: a neve acumulada acima de um limiar no bordo de uma
+    /// janela desprende-se e cai. Nos cantos do ecrã/barra de tarefas não cai.
+    fn spill_edges(&mut self, dt: f32) {
+        for pi in 0..self.piles.len() {
+            if self.piles[pi].state != PileState::Settled {
+                continue;
+            }
+            let n = self.piles[pi].cells.len();
+            if n == 0 {
+                continue;
+            }
+            let left_screen = self.edge_is_screen(&self.piles[pi], true);
+            let right_screen = self.edge_is_screen(&self.piles[pi], false);
+            let sides = [(true, 0usize, left_screen), (false, n - 1, right_screen)];
+            for (left, idx, screen) in sides {
+                if screen {
+                    continue;
+                }
+                let h = self.piles[pi].cells[idx];
+                let threshold = (self.piles[pi].max_h - EDGE_SPILL_MARGIN).max(0.0);
+                if h <= threshold {
+                    continue;
+                }
+                // Não deixar cair neve de um canto escondido por uma janela
+                // da frente: as partículas soltas são desenhadas por cima.
+                let pile = &self.piles[pi];
+                let x_edge = if left {
+                    pile.rect.x - 1.0
+                } else {
+                    pile.rect.right() + 1.0
+                };
+                let y_edge = pile.rect.y + pile.slide_y - h;
+                if self.point_covered(x_edge, y_edge, pi) {
+                    continue;
+                }
+                let amount = ((h - threshold) * EDGE_SPILL_RATE * dt).min(h);
+                if amount < 0.05 || self.loose.len() >= MAX_LOOSE {
+                    continue;
+                }
+                self.piles[pi].cells[idx] = h - amount;
+                self.spawn_edge_particles(pi, left, amount);
+            }
+        }
+    }
+
     /// Passo de simulação.
     pub fn step(&mut self, dt: f32, target: usize, spawn_rate: f32) {
         self.time += dt;
@@ -460,6 +901,9 @@ impl World {
         if dead {
             self.piles.retain(|p| !p.is_dead());
         }
+
+        // --- transbordo nos bordos das janelas -----------------------------
+        self.spill_edges(dt);
 
         // --- emissão -------------------------------------------------------
         let target = target.min(MAX_PARTICLES);
@@ -542,6 +986,56 @@ impl World {
             p.y = y;
             p.phase = phase;
             i += 1;
+        }
+
+        // --- partículas soltas (escavação) ---------------------------------
+        let mut li = 0;
+        while li < self.loose.len() {
+            let l = self.loose[li];
+            let prev_bottom = l.y + l.r;
+            let x = l.x + l.vx * dt;
+            let y = l.y + l.vy * dt;
+            let vy = l.vy + LOOSE_GRAVITY * dt;
+            let vx = l.vx * (1.0 - 1.6 * dt).max(0.0);
+            let bottom = y + l.r;
+
+            let mut landing: Option<usize> = None;
+            if vy > 0.0 {
+                for (pi, pile) in self.piles.iter().enumerate() {
+                    if pile.state != PileState::Settled || pile.rect.y <= 2.0 {
+                        continue;
+                    }
+                    if x < pile.rect.x - 1.0 || x > pile.rect.right() + 1.0 {
+                        continue;
+                    }
+                    let top = pile.rect.y + pile.slide_y - pile.height_at(x);
+                    if prev_bottom <= top && bottom >= top && !self.point_covered(x, top, pi) {
+                        match landing {
+                            Some(best) if self.piles[best].rect.y <= pile.rect.y => {}
+                            _ => landing = Some(pi),
+                        }
+                    }
+                }
+            }
+
+            if let Some(pi) = landing {
+                let r = l.r.clamp(0.5, 2.0);
+                self.piles[pi].deposit(x, r * 0.7);
+                self.loose.swap_remove(li);
+                continue;
+            }
+
+            if x < -40.0 || x > self.width + 40.0 || y > self.height + 40.0 {
+                self.loose.swap_remove(li);
+                continue;
+            }
+
+            let l = &mut self.loose[li];
+            l.x = x;
+            l.y = y;
+            l.vx = vx;
+            l.vy = vy;
+            li += 1;
         }
     }
 }
@@ -696,6 +1190,210 @@ mod tests {
         assert!(
             taskbar_pile.max_height() > 0.0,
             "a barra de tarefas devia receber a neve"
+        );
+    }
+
+    #[test]
+    fn tall_pile_keeps_a_natural_slope() {
+        // Deposição concentrada numa faixa estreita (como acontece com o
+        // vento): o manto deve espalhar-se lateralmente em vez de formar uma
+        // agulha de neve.
+        let mut world = World::new(1920.0, 1080.0);
+        let s = window(31, 0, 0.0, 1020.0, 1920.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..3600 {
+            world.piles[0].deposit(1200.0, 2.0);
+            world.piles[0].relax(1.0 / 60.0);
+        }
+        let cells = &world.piles[0].cells;
+        let max_step = cells
+            .windows(2)
+            .map(|w| (w[0] - w[1]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_step < 4.0,
+            "declive excessivo entre células: {max_step:.2} (altura máx {:.1})",
+            world.piles[0].max_height()
+        );
+        assert!(
+            world.piles[0].max_height() > 15.0,
+            "a neve devia acumular em altura"
+        );
+        assert!(
+            world.piles[0].max_height() <= MAX_WINDOW_SNOW + 0.01,
+            "o teto de altura devia ser respeitado"
+        );
+    }
+
+    #[test]
+    fn cursor_push_moves_mass_forward_and_conserves_it() {
+        let mut world = World::new(1920.0, 1080.0);
+        let s = window(41, 1, 300.0, 300.0, 800.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..200 {
+            world.piles[0].deposit(700.0, 2.5);
+        }
+        let before: f32 = world.piles[0].cells.iter().sum();
+        // Cursores: primeiro fixa a posição, depois move para a direita.
+        world.interact(Some((650.0, 295.0)), 30.0, 1.0 / 60.0);
+        world.interact(Some((700.0, 295.0)), 30.0, 1.0 / 60.0);
+
+        let after: f32 = world.piles[0].cells.iter().sum();
+        let tol = before * 0.002 + 0.5;
+        assert!(
+            (after - before).abs() <= tol,
+            "o volume devia conservar-se: {before:.2} -> {after:.2}"
+        );
+
+        let left = world.piles[0].height_at(700.0 - 45.0);
+        let right = world.piles[0].height_at(700.0 + 45.0);
+        assert!(
+            right > left,
+            "a crista da frente devia ser maior: esq={left:.2} dir={right:.2}"
+        );
+    }
+
+    #[test]
+    fn overflow_at_interior_window_edge_falls_as_particles() {
+        let mut world = World::new(1920.0, 1080.0);
+        let s = window(43, 1, 200.0, 300.0, 300.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..120 {
+            world.piles[0].deposit(230.0, 2.5);
+        }
+        // Parado, para não confundir com as partículas do movimento rápido.
+        world.interact(Some((230.0, 295.0)), 30.0, 1.0 / 60.0);
+        world.interact(Some((230.0, 295.0)), 30.0, 1.0 / 60.0);
+        assert!(
+            !world.loose.is_empty(),
+            "o excesso no bordo devia cair como neve solta"
+        );
+    }
+
+    #[test]
+    fn overflow_at_screen_edge_is_swept_off_screen() {
+        let mut world = World::new(1920.0, 1080.0);
+        let s = window(45, 1, 0.0, 300.0, 300.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..120 {
+            world.piles[0].deposit(30.0, 2.5);
+        }
+        // Parado: sem partículas do movimento rápido.
+        world.interact(Some((30.0, 295.0)), 42.0, 1.0 / 60.0);
+        assert!(
+            world.loose.iter().any(|p| p.vx < 0.0),
+            "o excesso no limite esquerdo devia ser varrido para fora"
+        );
+    }
+
+    #[test]
+    fn natural_accumulation_spills_over_a_window_edge() {
+        let mut world = World::new(1920.0, 1080.0);
+        let s = window(47, 1, 300.0, 300.0, 400.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..200 {
+            world.piles[0].deposit(302.0, 2.5);
+        }
+        // Coluna de bordo cheia: o transbordo deve disparar.
+        world.piles[0].cells[0] = world.piles[0].max_h;
+        world.spill_edges(1.0);
+        assert!(
+            !world.loose.is_empty(),
+            "o excesso no bordo devia transbordar naturalmente"
+        );
+    }
+
+    #[test]
+    fn snow_height_has_strict_caps() {
+        let mut world = World::new(1920.0, 1080.0);
+        let win = window(49, 1, 100.0, 300.0, 400.0);
+        let bar = Surface {
+            id: 50,
+            kind: SurfaceKind::Taskbar,
+            rect: Rect::new(0.0, 1020.0, 1920.0, 60.0),
+            z: 0,
+        };
+        world.sync_surfaces(&[win, bar], true);
+        for _ in 0..600 {
+            let wi = world.piles.iter().position(|p| p.id == 49).unwrap();
+            world.piles[wi].deposit(300.0, 2.5);
+            let bi = world.piles.iter().position(|p| p.id == 50).unwrap();
+            world.piles[bi].deposit(900.0, 2.5);
+        }
+        let win = world.piles.iter().find(|p| p.id == 49).unwrap();
+        let bar = world.piles.iter().find(|p| p.id == 50).unwrap();
+        assert!(
+            win.max_height() <= MAX_WINDOW_SNOW + 0.01,
+            "teto da janela excedido: {:.2}",
+            win.max_height()
+        );
+        assert!(
+            bar.max_height() <= MAX_TASKBAR_SNOW + 0.01,
+            "teto da barra excedido: {:.2}",
+            bar.max_height()
+        );
+        assert!(win.max_height() > MAX_WINDOW_SNOW - 3.0);
+        assert!(bar.max_height() > MAX_TASKBAR_SNOW - 3.0);
+    }
+
+    #[test]
+    fn accumulated_snow_is_fully_opaque() {
+        let mut world = World::new(800.0, 600.0);
+        let s = window(19, 1, 100.0, 300.0, 400.0);
+        world.sync_surfaces(&[s], true);
+        assert_eq!(world.piles[0].alpha(), 1.0);
+    }
+
+    #[test]
+    fn cursor_carves_a_smooth_crater_that_relaxes() {
+        let mut world = World::new(800.0, 600.0);
+        let s = window(21, 1, 100.0, 300.0, 400.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..120 {
+            world.piles[0].deposit(200.0, 2.5);
+        }
+        let before = world.piles[0].height_at(200.0);
+        assert!(before > 1.0);
+
+        for _ in 0..30 {
+            world.interact(Some((200.0, 295.0)), 42.0, 1.0 / 60.0);
+        }
+        let center = world.piles[0].height_at(200.0);
+        assert!(center < before * 0.6, "o cursor devia cavar uma cratera");
+        assert!(
+            world.piles[0].hole_at(200.0) > 0.3,
+            "a cratera devia ficar marcada"
+        );
+
+        // O relaxamento térmico suaviza as paredes e recompõe parte da altura
+        // mesmo sem novos flocos.
+        run(&mut world, 1.0);
+        let relaxed = world.piles[0].height_at(200.0);
+        assert!(relaxed > center, "a cratera devia suavizar/relaxar");
+        assert!(relaxed < before, "a depressão devia continuar visível");
+
+        // Neve nova acelera o preenchimento.
+        let hole_before = world.piles[0].hole_at(200.0);
+        for _ in 0..30 {
+            world.piles[0].deposit(200.0, 2.5);
+        }
+        assert!(world.piles[0].hole_at(200.0) < hole_before);
+        assert!(world.piles[0].height_at(200.0) > relaxed);
+    }
+
+    #[test]
+    fn fast_cursor_throws_loose_snow() {
+        let mut world = World::new(800.0, 600.0);
+        let s = window(23, 1, 100.0, 300.0, 400.0);
+        world.sync_surfaces(&[s], true);
+        for _ in 0..80 {
+            world.piles[0].deposit(200.0, 2.5);
+        }
+        world.interact(Some((200.0, 295.0)), 30.0, 1.0 / 60.0);
+        world.interact(Some((280.0, 295.0)), 30.0, 1.0 / 60.0);
+        assert!(
+            !world.loose.is_empty(),
+            "um movimento rápido devia projetar partículas"
         );
     }
 }

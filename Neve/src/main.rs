@@ -16,15 +16,6 @@ mod tray;
 mod winutil;
 
 fn main() {
-    // Necessário para `ITaskbarList2` (evita que o Windows retire o topmost à
-    // barra de tarefas por causa do overlay fullscreen).
-    let _ = unsafe {
-        windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-        )
-    };
-
     std::panic::set_hook(Box::new(|info| {
         winutil::log(&format!("panic: {info}"));
     }));

@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, POINT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{
     CreateMutexW, CreateWaitableTimerExW, SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -21,9 +21,9 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, TranslateMessage,
-    MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT, WM_CONTEXTMENU,
-    WM_LBUTTONDBLCLK, WM_QUIT, WM_RBUTTONUP,
+    DispatchMessageW, GetCursorPos, MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage,
+    TranslateMessage, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT,
+    WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_QUIT, WM_RBUTTONUP,
 };
 
 use crate::autostart;
@@ -91,11 +91,12 @@ pub fn run() -> Result<(), String> {
 
     winutil::log("SnowHush iniciado");
     winutil::log(&format!(
-        "config: intensidade={:?} acumular={} janelas={} atrás={}",
+        "config: intensidade={:?} acumular={} janelas={} atrás={} raio_escavação={:.0}px",
         app.settings.intensity,
         app.settings.accumulate,
         app.settings.snow_on_windows,
-        app.settings.behind_windows
+        app.settings.behind_windows,
+        app.settings.carve_radius
     ));
 
     let result = app.message_loop();
@@ -311,6 +312,18 @@ impl App {
         let rate = self.settings.spawn_rate(self.area_mpx, self.world.time);
         self.world.step(dt, target, rate);
 
+        // Cursor global em píxeis físicos, convertido para as coordenadas do
+        // overlay. O overlay continua click-through: só se lê a posição.
+        let cursor = {
+            let mut pt = POINT::default();
+            if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+                Some(((pt.x - self.origin.0) as f32, (pt.y - self.origin.1) as f32))
+            } else {
+                None
+            }
+        };
+        self.world.interact(cursor, self.settings.carve_radius, dt);
+
         if std::env::var_os("SNOWHUSH_LOG").is_some() {
             self.frame_count += 1;
             self.frame_time += dt;
@@ -446,10 +459,22 @@ fn parse_args(settings: &mut Settings) {
             "--no-accumulate" => settings.accumulate = false,
             "--no-windows" => settings.snow_on_windows = false,
             "--behind" => settings.behind_windows = true,
+            "--carve-radius" => {
+                if let Some(value) = args.get(i + 1) {
+                    if let Ok(radius) = value.parse::<f32>() {
+                        settings.carve_radius = radius.clamp(20.0, 80.0);
+                    }
+                    i += 1;
+                }
+            }
             _ => {
                 if let Some(value) = arg.strip_prefix("--intensity=") {
                     if let Some(intensity) = Intensity::parse(value) {
                         settings.intensity = intensity;
+                    }
+                } else if let Some(value) = arg.strip_prefix("--carve-radius=") {
+                    if let Ok(radius) = value.parse::<f32>() {
+                        settings.carve_radius = radius.clamp(20.0, 80.0);
                     }
                 }
             }

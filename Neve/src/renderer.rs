@@ -53,7 +53,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::geometry::Rect;
-use crate::sim::{Particle, Pile, SurfaceKind, World};
+use crate::sim::{LooseSnow, Particle, Pile, World};
 
 /// Número de níveis de opacidade pré-calculados (pincéis ficam em cache).
 const ALPHA_LEVELS: usize = 32;
@@ -203,7 +203,7 @@ impl Renderer {
                     r: 0.965,
                     g: 0.978,
                     b: 1.0,
-                    a: 0.97,
+                    a: 1.0,
                 },
             },
             D2D1_GRADIENT_STOP {
@@ -212,7 +212,7 @@ impl Renderer {
                     r: 0.78,
                     g: 0.85,
                     b: 0.97,
-                    a: 0.94,
+                    a: 1.0,
                 },
             },
         ];
@@ -309,13 +309,25 @@ impl Renderer {
             self.occluders.clear();
             for pile in &world.piles {
                 if !pile.sliding() {
-                    self.occluders.push((pile.z, pile.rect));
+                    // Inclui a coluna de neve por cima do topo: um monte alto
+                    // (a barra de tarefas pode cobrir o ecrã) esconde a neve
+                    // dos montes que estão atrás dele.
+                    let snow = pile.max_height();
+                    self.occluders.push((
+                        pile.z,
+                        Rect::new(
+                            pile.rect.x,
+                            pile.rect.y - snow,
+                            pile.rect.w,
+                            pile.rect.h + snow,
+                        ),
+                    ));
                 }
             }
             for pile in &world.piles {
                 self.draw_pile(pile);
             }
-            self.draw_flakes(&world.particles);
+            self.draw_flakes(&world.particles, &world.loose);
 
             self.d2d_context
                 .EndDraw(None, None)
@@ -357,12 +369,7 @@ impl Renderer {
         let base = (max_h * 0.22).clamp(0.0, 1.25);
 
         let x0 = pile.rect.x;
-        // A barra de tarefas está encostada ao fundo do ecrã: se a neve fosse
-        // desenhada para cima, cobriria o bordo inferior das janelas abertas
-        // por cima dela. O perfil é deslocado para dentro da barra, de modo
-        // que os picos tocam no topo mas a camada não invade as janelas.
-        let inside_taskbar = pile.kind == SurfaceKind::Taskbar;
-        let base_y = pile.rect.y + pile.slide_y + if inside_taskbar { max_h } else { 0.0 };
+        let base_y = pile.rect.y + pile.slide_y;
         // A neve "drapa" 1-2 px pela fachada, em vez de terminar numa linha
         // perfeitamente reta.
         let overhang = (max_h * 0.16).clamp(0.4, 2.2);
@@ -377,10 +384,11 @@ impl Renderer {
 
         // Segmentos visíveis (as células tapadas por janelas da frente não são
         // desenhadas). Cada troço contínuo dá origem a uma figura fechada.
+        // As células baixas continuam no mesmo troço: o perfil desce em curva
+        // até à base em vez de criar um corte vertical nas crateras.
         let mut run_start: Option<usize> = None;
         for i in 0..=n {
-            let visible =
-                i < n && pile.cells[i] + base >= 0.12 && self.cell_visible(pile, i, base_y, base);
+            let visible = i < n && self.cell_visible(pile, i, base_y, base);
             if visible {
                 if run_start.is_none() {
                     run_start = Some(i);
@@ -429,7 +437,7 @@ impl Renderer {
         unsafe {
             self.pile_gradient.SetStartPoint(Vector2 {
                 X: 0.0,
-                Y: base_y - max_h,
+                Y: bottom - 140.0,
             });
             self.pile_gradient
                 .SetEndPoint(Vector2 { X: 0.0, Y: bottom });
@@ -443,7 +451,8 @@ impl Renderer {
     /// `true` se a célula `i` não estiver tapada por uma janela mais acima.
     fn cell_visible(&self, pile: &Pile, i: usize, base_y: f32, base: f32) -> bool {
         let cw = pile.cell_w;
-        let h = pile.cells[i] + base;
+        let base_i = base * (1.0 - pile.hole[i].clamp(0.0, 1.0));
+        let h = pile.cells[i] + base_i;
         let left = pile.rect.x + i as f32 * cw;
         let top = base_y - h;
         let cell = Rect::new(left, top, cw, base_y - top + 0.8);
@@ -460,9 +469,12 @@ impl Renderer {
     /// Direct2D tesselar a elipse em software), o que a 700 partículas dava
     /// ~4 ms/frame. Um `DrawBitmap` filtrado é substancialmente mais barato e o
     /// resultado é mais suave (halo desfocado em vez de disco duro).
-    fn draw_flakes(&mut self, particles: &[Particle]) {
+    fn draw_flakes(&mut self, particles: &[Particle], loose: &[LooseSnow]) {
         let Some(bitmap) = self.flake_bitmap.clone() else {
             for p in particles {
+                self.draw_flake(p.x, p.y, p.r, p.alpha);
+            }
+            for p in loose {
                 self.draw_flake(p.x, p.y, p.r, p.alpha);
             }
             return;
@@ -474,6 +486,26 @@ impl Renderer {
                 }
                 // A textura tem uma queda radial; 2,1× o raio do núcleo deixa
                 // um halo ténue à volta do floco.
+                let s = p.r * 2.1;
+                let dest = D2D_RECT_F {
+                    left: p.x - s,
+                    top: p.y - s,
+                    right: p.x + s,
+                    bottom: p.y + s,
+                };
+                self.d2d_context.DrawBitmap(
+                    &bitmap,
+                    Some(&dest),
+                    (p.alpha * 0.95).clamp(0.0, 1.0),
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    None,
+                    None,
+                );
+            }
+            for p in loose {
+                if p.alpha <= 0.02 {
+                    continue;
+                }
                 let s = p.r * 2.1;
                 let dest = D2D_RECT_F {
                     left: p.x - s,
@@ -544,7 +576,7 @@ fn add_snow_run(
     let pl = left - if edge_left { lip } else { 0.0 };
     let pr = right + if edge_right { lip } else { 0.0 };
 
-    let mut points: Vec<Vector2> = Vec::with_capacity(end - start + 2);
+    let mut points: Vec<Vector2> = Vec::with_capacity((end - start) * 2 + 2);
     if edge_left {
         let x = left + cw * 0.5;
         let h = snow_top(pile, x, seed, base);
@@ -553,12 +585,16 @@ fn add_snow_run(
             Y: base_y - h * 0.35,
         });
     }
-    for i in start..end {
-        let x = x0 + (i as f32 + 0.5) * cw;
+    // Amostragem a meia célula (2 px): mais pontos na curva de Bézier deixam
+    // a cratera do cursor e o grão da superfície completamente suaves.
+    let step = cw * 0.5;
+    let mut x = left + step * 0.5;
+    while x < right - 0.01 {
         points.push(Vector2 {
             X: x,
             Y: base_y - snow_top(pile, x, seed, base),
         });
+        x += step;
     }
     if edge_right {
         let x = right - cw * 0.5;
@@ -624,16 +660,28 @@ fn add_snow_run(
 /// perfeita do topo. A deriva é proporcional à espessura; o ruído fino é
 /// limitado para não parecer serrilhado.
 fn snow_top(pile: &Pile, x: f32, seed: f32, base: f32) -> f32 {
+    // Buracos escavados não recebem a camada de base: o que está por baixo
+    // volta a ver-se até novos flocos preencherem a falha.
+    let base = base * (1.0 - pile.hole_at(x).clamp(0.0, 1.0));
     let h = pile.height_at(x) + base;
     let drift = 0.11 * (x * 0.031 + seed * 3.1).sin()
         + 0.075 * (x * 0.082 + seed * 1.7).sin()
         + 0.045 * (x * 0.19 + seed * 0.6).sin();
+    // Variação limitada: com os tetos de 24/48 px, desvios grandes deixariam
+    // o topo com dentes. A suavidade vem da física; aqui fica só o relevo.
+    let drift = (h * drift).clamp(-3.0, 3.0);
     let amp = (h.min(14.0) / 14.0) * 0.85 + 0.05;
     let lumps = amp
         * (0.55 * (x * 0.44 + seed * 2.3).sin()
             + 0.34 * (x * 0.97 + seed * 0.9).sin()
             + 0.14 * (x * 2.1 + seed * 1.3).sin());
-    (h * (1.0 + drift) + lumps).max(0.10)
+    // Grão estático fino: pequenas ondulações de ~4-17 px que dão aspeto
+    // tátil à neve fofa sem animar (não "ferve" com o tempo).
+    let grain = 0.55 * (x * 0.41 + seed * 4.7).sin()
+        + 0.30 * (x * 0.93 + seed * 2.1).sin()
+        + 0.12 * (x * 1.7 + seed * 3.3).sin();
+    let grain_amp = ((h.min(26.0) / 26.0) * 0.8 + 0.15) * 0.55;
+    (h + drift + lumps + grain_amp * grain).max(0.10)
 }
 
 /// Interseção de dois retângulos.

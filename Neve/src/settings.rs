@@ -63,6 +63,8 @@ pub struct Settings {
     pub snow_on_windows: bool,
     /// Desenhar o overlay atrás das janelas abertas (estilo papel de parede).
     pub behind_windows: bool,
+    /// Raio (px) da escavação provocada pelo cursor sobre a neve.
+    pub carve_radius: f32,
     /// Estado espelhado da chave de arranque automático (só para o menu).
     pub autostart: bool,
 }
@@ -74,6 +76,7 @@ impl Default for Settings {
             accumulate: true,
             snow_on_windows: true,
             behind_windows: false,
+            carve_radius: 42.0,
             autostart: false,
         }
     }

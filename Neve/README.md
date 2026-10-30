@@ -56,6 +56,7 @@ Opções de linha de comandos (úteis para atalhos ou para o arranque automátic
 --no-accumulate                                 começa sem acumulação
 --no-windows                                    a neve não pousa sobre janelas
 --behind                                        começa atrás das janelas
+--carve-radius <20..80>                         raio (px) da escavação do cursor (omissão: 42)
 --help, -h                                      mostra esta ajuda
 ```
 
@@ -151,22 +152,57 @@ Cada floco tem velocidade de queda própria, oscilação lateral harmónica
 soma de três senos de períodos distintos (barato e sem ruído de alta frequência).
 
 A acumulação é um **campo de alturas por superfície**: cada janela tem um vetor
-de alturas (uma célula de 4 px por coluna do topo da janela). Quando um floco
+de alturas (uma célula de 2 px por coluna do topo da janela). Quando um floco
 atravessa o topo, o seu volume é distribuído por uma gaussiana estreita (com um
-pequeno desvio lateral), o que forma grumos irregulares em vez de torres
-alinhadas à grelha. As alturas sofrem difusão (alisamento) e deslizamento com
-ângulo de repouso, além de derretimento lento; o máximo é 28 px (32 px na barra
-de tarefas). Uma camada de base contínua cobre toda a superfície com neve, para
-que as faixas deixadas pelo vento não apareçam como "buracos". Na barra de
-tarefas o perfil é desenhado para dentro da barra, para que a neve não invada o
-bordo inferior das janelas abertas por cima dela.
+pequeno desvio lateral). O relevo é alisado a cada tick por duas passagens do
+filtro térmico `(h[i-1] + 2*h[i] + h[i+1]) / 4` e por um solver de ângulo de
+repouso (8 passagens), produzindo curvas contínuas de fluido viscoso.
+
+A altura é **estritamente limitada**:
+
+* topo de janelas: **24 px**;
+* barra de tarefas/fundo do ecrã: **48 px** (nunca tapa os ícones da barra).
+
+Ao atingir o teto, a neve nova escorrega para as células vizinhas mais baixas
+(até 80 px de distância); o que não couber derrete/desaparece. Uma camada de
+base contínua cobre toda a superfície com neve, para que as faixas deixadas pelo
+vento não apareçam como "buracos".
+
+A renderização dos montes é **100% opaca** (o gradiente branco→azulado não usa
+canal alfa).
+
+#### Interação com o cursor
+
+A posição global do rato é lida com `GetCursorPos` a cada frame (o overlay
+continua `WS_EX_TRANSPARENT`, por isso os cliques atravessam normalmente).
+
+* Quando o cursor está sobre a massa de neve de um monte, as células num raio
+  configurável (`--carve-radius`, 20–80 px; omissão 42) são escavadas com
+  falloff smoothstep (derivada nula nas extremidades), formando uma cratera
+  côncava sem arestas.
+* O volume removido é **conservado**: é empurrado para as cristas laterais, com
+  a maior parte a seguir a direção do movimento (fica um monte à frente). O
+  restante distribui-se atrás.
+* Nos bordos interiores de uma janela o excesso **transborda como partículas
+  ativas**, que caem sob gravidade a partir do canto e podem assentar numa
+  janela inferior ou no fundo do ecrã. Nos limites laterais do ecrã (e da barra
+  de tarefas) o excesso é **varrido para fora do monitor** e descartado.
+* A neve no bordo de uma janela só transborda naturalmente quando está a menos
+  de 3 px do teto (0,8× o excesso por segundo), evitando dentes permanentes.
+* A marca de escavação (`hole`) atenua a camada de base e desvanece ao longo de
+  ~1,2 s; o relaxamento térmico suaviza as paredes da cratera e recompõe-na
+  gradualmente (mais depressa com neve nova).
+* Se o cursor se mover depressa (> 220 px/s), são projetadas partículas soltas
+  com velocidade lateral/ascendente; estas caem e voltam a assentar nos montes.
+* A interação corre no thread principal, com custo O(células no raio) por frame,
+  mantendo os 60 FPS.
 
 Reações:
 
 * **mover/redimensionar** → o monte antigo desprende-se, escorrega com gravidade
   e desvanece; nasce um monte vazio na posição nova;
 * **minimizar/fechar** → o monte desprende-se e desaparece;
-* **Melt Snow** → derretimento acelerado (11 px/s) até desaparecer;
+* **Melt Snow** → derretimento acelerado (120 px/s) até desaparecer;
 * **Off** → overlay escondido e estado limpo.
 
 Occlusão: um topo tapado por outra janela mais acima na ordem Z **não** recebe
@@ -181,11 +217,12 @@ realmente visível.
 3. `IDCompositionDevice::CreateTargetForHwnd` + `IDCompositionVisual` — a
    transparência é composta pelo DWM, com alfa por píxel e aceleração de GPU.
 4. Direct2D desenha sobre o back-buffer:
-   * montes: um único *path* por troço visível, com o topo suavizado por
-     Béziers (Catmull-Rom) e relevo multi-escala; gradiente branco→azulado e
-     uma sombra ténue dão volume à camada;
-   * flocos: `DrawBitmap` de uma textura 32×32 gerada em código (ponto branco
-     com queda radial), escalada pela GPU.
+   * montes: um único *path* por troço visível, amostrado a meia célula (2 px)
+     e suavizado por Béziers (Catmull-Rom); relevo multi-escala e grão estático
+     fino dão aspeto tátil; gradiente branco→azulado **opaco** e uma sombra
+     ténue dão volume à camada;
+   * flocos e partículas soltas: `DrawBitmap` de uma textura 32×32 gerada em
+     código (ponto branco com queda radial), escalada pela GPU.
 5. `Present(sync=1)` sincroniza com o vblank.
 
 O ritmo é fixado a 60 Hz por um **waitable timer de alta resolução**
@@ -220,7 +257,9 @@ passar a uma textura + `DrawBitmap` reduziu o custo para menos de metade.
 
 * É um modelo 2.5D: a neve pousa na **primeira aresta horizontal visível** que
   encontra. Se o topo de uma janela estiver por baixo do topo visível de outra,
-  recebe pouca ou nenhuma neve (não há simulação em profundidade).
+  recebe pouca ou nenhuma neve (não há simulação em profundidade). Pela mesma
+  razão, a escavação do cursor remove a coluna de neve na abcissa do ponteiro
+  (o perfil é unidimensional), em vez de abrir uma cratera apenas à superfície.
 * Janelas *fullscreen* exclusivas (jogos) ficam por cima do overlay; em modo
   janela/borderless funciona normalmente.
 * O modo **Behind Windows** insere o overlay imediatamente abaixo do `WorkerW`
@@ -244,7 +283,7 @@ mensagem.
 cargo test
 ```
 
-Oito testes cobrem a física (queda e deposição, oclusão de topos, degelo,
+Dezassete testes cobrem a física (queda e deposição, oclusão de topos, degelo,
 deslocamento/redimensionamento de janelas, fecho, desativação da acumulação e
 topos no limite do ecrã) e a geração do ícone da bandeja.
 

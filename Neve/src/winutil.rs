@@ -137,6 +137,7 @@ pub fn show_help() {
          --no-accumulate     desliga a acumulação\n\
          --no-windows        a neve não pousa sobre janelas\n\
          --behind            desenha atrás das janelas\n\
+         --carve-radius <px> raio da escavação do cursor (20-80)\n\
          \n\
          O ícone na bandeja do sistema contém todas as opções.",
     );
